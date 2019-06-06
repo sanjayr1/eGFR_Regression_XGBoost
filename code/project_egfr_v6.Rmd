@@ -1,0 +1,267 @@
+---
+title: "eGFR Prediction Using xGboost Regression"
+author: "Roberts, Haddad, Coady"
+date: '`r format(Sys.time(),"%B %d, %Y")`'
+output:
+  pdf_document: default
+  word_document: default
+  html_document: default
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(gbm)
+library(caret)
+library(tidyverse)
+library(xgboost)
+library(data.table)
+library(Ckmeans.1d.dp)
+```
+
+
+```{r}
+egfr <- read.csv("egfr_clean.csv")[,-1]
+set.seed(283749)
+
+train_indicies <- sample(c(1:nrow(egfr)), size=nrow(egfr)*0.5)
+valid_indicies <- sample(setdiff(c(1:nrow(egfr)),train_indicies), size=nrow(egfr)*0.25)
+test_indicies  <- setdiff(c(1:nrow(egfr)), c(valid_indicies,train_indicies))
+
+nrow(egfr) == length(train_indicies)+length(valid_indicies)+length(test_indicies)
+
+train <- egfr[train_indicies,]
+val   <- egfr[valid_indicies,]
+test  <- egfr[test_indicies, ]
+
+setDT(train) 
+setDT(val)
+setDT(test)
+
+train_y <- train$score_18 
+val_y   <- val$score_18
+test_y  <- test$score_18
+
+train_X <- train[,-c("score_18")]
+val_X   <- val[,-c("score_18")]
+test_X  <- test[,-c("score_18")]
+
+dtrain <- xgb.DMatrix(data=as.matrix(train_X),label=train_y) 
+dval   <- xgb.DMatrix(data=as.matrix(val_X),label=val_y)
+```
+
+##### GET FEATURE IMPORTANCE ######
+
+```{r}
+params <- list(booster="gbtree",metrics="test_rmse",eta=0.3,gamma=0,max_depth=6,min_child_weight=1,subsample=1,colsample_bytree=1)
+xgb1 <- xgb.train(data=dtrain,nrounds=100,watchlist=list(train=dtrain),print.every.n=10,early.stop.round=10,maximize=F)
+
+best_score<-xgb1$best_score
+
+cat("best residual mean squared error", best_score, "\n")
+
+y_pred <- predict(xgb1,as.matrix(val_X))
+sse <- sum((val_y - y_pred) ** 2)
+tse <- sum((val_y - mean(val_y)) ** 2)
+r_squared<-1-(sse/tse)
+
+cat("r-squared", r_squared, "\n")
+
+important_Df <- xgb.importance(model=xgb1)
+```
+
+```{r}
+xgb.ggplot.importance(importance_matrix=important_Df)
+
+#xgb.ggplot.deepness(model = xgb1, which = c("2x1", "max.depth","med.depth", "med.weight"))
+
+#xgb.plot.multi.trees(xgb1)
+```
+
+```{r}
+write.csv(file="feature_importance.csv", x=important_Df)
+```
+
+
+# test reducing model complexity
+
+```{r}
+iterations = nrow(important_Df)-3
+results <- matrix(ncol=2, nrow=iterations)
+
+for(row in 1:iterations){
+  print(row)
+  last_col <- nrow(important_Df)-row
+  egfr_loop <- egfr[c(c(important_Df[1:last_col,]$Feature), "score_18")]
+  
+  train_mc <- egfr_loop[train_indicies,]
+  val_mc   <- egfr_loop[valid_indicies,]
+
+  setDT(train_mc) 
+  setDT(val_mc)
+
+  train_mc_y <- train_mc$score_18 
+  val_mc_y   <- val_mc$score_18
+
+  train_mc_X <- train_mc[,-c("score_18")]
+  val_mc_X   <- val_mc[,-c("score_18")]
+
+  dtrain_mc <- xgb.DMatrix(data=as.matrix(train_mc_X),label=train_mc_y) 
+  dval_mc   <- xgb.DMatrix(data=as.matrix(val_mc_X),label=val_mc_y)
+  
+  params <- list(booster="gbtree",metrics="test_rmse",eta=0.1,gamma=0,max_depth=10,min_child_weight=1,subsample=1,colsample_bytree=1,verbose=0)
+  xgb1 <- xgb.train(params=params,data=dtrain_mc,nrounds=700,watchlist=list(train=dtrain_mc),print.every.n=100000,early.stop.round=10,maximize=F)
+  
+  y_mc_pred <- predict(xgb1,as.matrix(train_mc_X))
+  sse <- sum((train_mc_y - y_mc_pred) ** 2)
+  tse <- sum((train_mc_y - mean(train_mc_y)) ** 2)
+  r_squared_train<-1-(sse/tse)
+  
+  y_mc_pred <- predict(xgb1,as.matrix(val_mc_X))
+  sse <- sum((val_mc_y - y_mc_pred) ** 2)
+  tse <- sum((val_mc_y - mean(val_mc_y)) ** 2)
+  r_squared_val<-1-(sse/tse)
+
+  results[row,] <- c(r_squared_train,r_squared_val)
+}
+results <- data.frame(results)
+colnames(results) <- c("trainR2", "valR2")
+```
+
+
+```{r}
+results
+```
+
+```{r}
+plot.ts(results)
+```
+
+```{r}
+ggplot(results, aes(seq(1:nrow(results)))) + 
+  geom_line(aes(y = trainR2, colour = "train")) + 
+  geom_line(aes(y = valR2, colour = "test")) +
+  ggtitle("Overfitting Graph") +
+  xlab("Number of Features Included") +
+  ylab("R-Squared")
+```
+
+```{r}
+write.csv(file="feature_selection_results.csv", x=results)
+```
+
+
+```{r}
+cat("keep the top", nrow(important_Df) - 11, "most important features")
+```
+
+### Best number of features is ... 14
+
+
+##### GRID SEARCH #####
+
+```{r}
+egfr <- egfr[c(c(important_Df[1:14,]$Feature), "score_18")]
+
+set.seed(283749)
+
+train_indicies <- sample(c(1:nrow(egfr)), size=nrow(egfr)*0.8)
+valid_indicies <- setdiff(c(1:nrow(egfr)), c(train_indicies))
+
+nrow(egfr) == length(train_indicies)+length(valid_indicies)
+
+train <- egfr[train_indicies,]
+val   <- egfr[valid_indicies,]
+
+# prepare training scheme
+control <- trainControl(method="repeatedcv", number=3, repeats=5)
+
+# design the parameter tuning grid
+grid <- expand.grid(eta=c(0.1,0.3,0.5), max_depth=c(3,7,11),
+                    colsample_bytree = seq(0.5, 0.9, length.out = 5),
+                    min_child_weight=1,gamma=0,subsample=1,nrounds=100)
+
+# train the model
+model <- train(score_18~., data=train, method="xgbTree", trControl=control, tuneGrid=grid)
+# summarize the model
+print(model)
+```
+
+
+```{r}
+model$results
+```
+
+```{r}
+model$bestTune
+```
+
+
+```{r}
+write.csv(file="grid_search_results.csv", x=model$results)
+```
+
+
+```{r}
+model$finalModel
+```
+
+
+```{r}
+y_pred <- predict(model,as.matrix(test_X))
+residuals = test_y - y_pred
+RMSE = sqrt(mean(residuals^2))
+cat("residual mean squared error", RMSE, "\n")
+
+sse <- sum((test_y - y_pred) ** 2)
+tse <- sum((test_y - mean(test_y)) ** 2)
+r_squared<-1-(sse/tse)
+
+cat("r-squared", r_squared, "\n")
+```
+
+# Feature Importance with Grid Search Model
+
+```{r}
+xgb1 <- xgb.train(eta = 0.1, max_depth = 11, gamma = 0, colsample_bytree = 0.9, min_child_weight = 1, subsample = 1, objective = "reg:linear", silent = 0,data=dtrain,nrounds=100,watchlist=list(train=dtrain),print.every.n=10,early.stop.round=10,maximize=F)
+
+important_Df <- xgb.importance(model=xgb1)
+```
+
+```{r}
+write.csv(file="feature_importance_post_gs.csv", x = important_Df)
+```
+
+
+
+# Continued Exploration Into Feature Importance (not in report, personal curiosity)
+
+```{r}
+# best 77 for score_17, eta =  0.005, 1000, 15
+xgb1 <- xgb.train(eta = 0.001, max_depth = 15, gamma = 0, colsample_bytree = 0.9, min_child_weight = 1, subsample = 1, objective = "reg:linear", silent = 0,data=dtrain,nrounds=3000,watchlist=list(train=dtrain),print.every.n=10,early.stop.round=10,maximize=F)
+
+important_Df <- xgb.importance(model=xgb1)
+```
+
+```{r}
+xgb.ggplot.importance(importance_matrix=important_Df)
+```
+
+```{r}
+important_Df[0:3,c("Feature","Gain")]
+```
+
+```{r}
+best_score<-xgb1$best_score
+
+cat("best residual mean squared error", best_score, "\n")
+
+y_pred <- predict(xgb1,as.matrix(val_X))
+sse <- sum((val_y - y_pred) ** 2)
+tse <- sum((val_y - mean(val_y)) ** 2)
+r_squared<-1-(sse/tse)
+
+cat("r-squared", r_squared, "\n")
+```
+
+0.84173559
